@@ -1,12 +1,11 @@
 /*
-  Project: Kissan Saathi - Smart Irrigation
-  Hardware:
-  - ESP32
-  - DHT11
-  - Soil Moisture Sensor
-  - 16x2 I2C LCD
-  - Relay Module
-  - DC Pump
+  Project: Kissan Saathi - Stable IoT Version
+  Features:
+  - Proper JSON parsing
+  - Mode based control (AUTO / MANUAL)
+  - WiFi reconnect
+  - Safe pump fallback
+  - Clean architecture
 */
 
 #include <WiFi.h>
@@ -20,15 +19,15 @@
    WiFi Credentials
 ========================= */
 
-const char* ssid = "YOUR_WIFI_NAME";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = "Airtel_Muh me lega?";
+const char* password = "Lega_nhi_dega1";
 
 /* =========================
    Backend URLs
 ========================= */
 
-const char* sensorUrl = "http://192.168.1.7:5000/api/esp32";
-const char* pumpUrl   = "http://192.168.1.7:5000/api/pump";
+const char* sensorUrl = "http://192.168.1.37:5000/api/esp32";
+const char* pumpUrl   = "http://192.168.1.37:5000/api/pump";
 
 /* =========================
    Pins
@@ -47,10 +46,9 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 ========================= */
 
 float moistureThreshold = 30.0;
-bool manualOverride = false;
-
-unsigned long lastTime = 0;
-unsigned long timerDelay = 5000;
+unsigned long lastSendTime = 0;
+unsigned long interval = 5000;  // 5 seconds
+unsigned long lastCommandTime = 0;
 
 /* =========================
    Setup
@@ -61,7 +59,7 @@ void setup() {
   Serial.begin(115200);
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // OFF initially (active LOW)
+  digitalWrite(RELAY_PIN, HIGH);  // Pump OFF (active LOW relay)
 
   dht.begin();
   lcd.init();
@@ -71,40 +69,45 @@ void setup() {
 }
 
 /* =========================
-   Loop
+   Main Loop
 ========================= */
 
 void loop() {
 
-  if ((millis() - lastTime) > timerDelay) {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+  }
 
-    if (WiFi.status() == WL_CONNECTED) {
+  if (millis() - lastSendTime > interval) {
 
-      float temperature = dht.readTemperature();
-      float humidity = dht.readHumidity();
-      float moisture = readSoilMoisture();
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    float moisture = readSoilMoisture();
 
-      displayOnLCD(temperature, humidity, moisture);
+    displayOnLCD(temperature, humidity, moisture);
 
-      sendSensorData(temperature, humidity, moisture);
+    sendSensorData(temperature, humidity, moisture);
 
-      checkPumpCommand();
+    checkPumpCommand(moisture);
 
-      autoLogic(moisture);
-    }
+    lastSendTime = millis();
+  }
 
-    lastTime = millis();
+  // Safety Fail-Safe (20 sec no command)
+  if (millis() - lastCommandTime > 20000) {
+    digitalWrite(RELAY_PIN, HIGH); // Force OFF
   }
 }
 
 /* =========================
-   WiFi
+   WiFi Connect
 ========================= */
 
 void connectWiFi() {
 
   WiFi.begin(ssid, password);
-  lcd.setCursor(0,0);
+
+  lcd.setCursor(0, 0);
   lcd.print("Connecting WiFi");
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -116,10 +119,12 @@ void connectWiFi() {
   lcd.print("WiFi Connected");
   delay(1000);
   lcd.clear();
+
+  Serial.println("WiFi Connected");
 }
 
 /* =========================
-   Soil Sensor
+   Soil Moisture
 ========================= */
 
 float readSoilMoisture() {
@@ -136,15 +141,15 @@ void displayOnLCD(float temp, float hum, float moist) {
 
   lcd.clear();
 
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print("T:");
-  lcd.print(temp);
+  lcd.print(temp, 1);
   lcd.print(" H:");
-  lcd.print(hum);
+  lcd.print(hum, 0);
 
-  lcd.setCursor(0,1);
+  lcd.setCursor(0, 1);
   lcd.print("M:");
-  lcd.print(moist);
+  lcd.print(moist, 0);
 
   if (digitalRead(RELAY_PIN) == LOW)
     lcd.print(" P:ON");
@@ -153,7 +158,7 @@ void displayOnLCD(float temp, float hum, float moist) {
 }
 
 /* =========================
-   Send Data
+   Send Sensor Data
 ========================= */
 
 void sendSensorData(float temp, float hum, float moist) {
@@ -172,17 +177,17 @@ void sendSensorData(float temp, float hum, float moist) {
 
   int httpCode = http.POST(body);
 
-  Serial.print("Data Sent: ");
+  Serial.print("Sensor POST Code: ");
   Serial.println(httpCode);
 
   http.end();
 }
 
 /* =========================
-   Fetch Pump Command
+   Pump Control Logic
 ========================= */
 
-void checkPumpCommand() {
+void checkPumpCommand(float moisture) {
 
   HTTPClient http;
   http.begin(pumpUrl);
@@ -193,31 +198,38 @@ void checkPumpCommand() {
 
     String payload = http.getString();
 
-    if (payload.indexOf("ON") > 0) {
-      digitalWrite(RELAY_PIN, LOW);
-      manualOverride = true;
-    }
-    else if (payload.indexOf("OFF") > 0) {
-      digitalWrite(RELAY_PIN, HIGH);
-      manualOverride = true;
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+
+      String state = doc["state"];
+      String mode = doc["mode"];
+      bool safety = doc["safetyActive"];
+
+      lastCommandTime = millis();
+
+      if (safety) {
+        digitalWrite(RELAY_PIN, HIGH);
+        return;
+      }
+
+      if (mode == "MANUAL") {
+
+        if (state == "ON")
+          digitalWrite(RELAY_PIN, LOW);
+        else
+          digitalWrite(RELAY_PIN, HIGH);
+      }
+      else if (mode == "AUTO") {
+
+        if (moisture < moistureThreshold)
+          digitalWrite(RELAY_PIN, LOW);
+        else
+          digitalWrite(RELAY_PIN, HIGH);
+      }
     }
   }
 
   http.end();
-}
-
-/* =========================
-   Auto Logic
-========================= */
-
-void autoLogic(float moisture) {
-
-  if (manualOverride) return;
-
-  if (moisture < moistureThreshold) {
-    digitalWrite(RELAY_PIN, LOW);   // Pump ON
-  }
-  else {
-    digitalWrite(RELAY_PIN, HIGH);  // Pump OFF
-  }
 }
